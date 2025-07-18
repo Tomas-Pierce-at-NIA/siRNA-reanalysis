@@ -302,4 +302,42 @@ if __name__ == '__main__':
     pyplot.savefig("TracePlot.png", bbox_inches="tight")
     pyplot.show()
     
+    az.plot_posterior(itrace, ['tau'])
+    pyplot.savefig('precision_posterior.svg', bbox_inches='tight')
+    pyplot.show()
+    
+    az.plot_posterior(itrace, ['starve_effect'])
+    pyplot.savefig('starvation_posterior.svg', bbox_inches='tight')
+    pyplot.show()
+    
+    az.plot_bf(itrace, ['base_const'])
+    pyplot.savefig('base_const_bf.svg', bbox_inches='tight')
+    pyplot.show()
+    
+    az.plot_posterior(itrace, ['gene_const'], coords={'gene': 'siCtrl'})
+    pyplot.title("gene_const siCtrl", fontsize=20)
+    pyplot.savefig("gene_const_sictrl_posterior.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    g_const_sum = az.summary(itrace, ['gene_const'])
+    where_control = g_const_sum.index == 'gene_const[siCtrl]'
+    g_const_sictrl = g_const_sum.loc[where_control]
+    sictrl_gconst_low = g_const_sictrl.iloc[0]['hdi_3%']
+    sictrl_gconst_high = g_const_sictrl.iloc[0]['hdi_97%']
+    
+    az.plot_posterior(itrace,
+                      ['gene_const'],
+                      ref_val=sictrl_gconst_low,
+                      grid=(6,7))
+    pyplot.savefig("below_sictrl_const.svg", bbox_inches='tight')
+    pyplot.show()
+    
+    az.plot_posterior(itrace,
+                      ['gene_const'],
+                      ref_val=sictrl_gconst_high,
+                      grid=(6,7))
+    pyplot.savefig('above_sictrl_const.svg', bbox_inches='tight')
+    pyplot.show()
+    
+    az.plot_posterior(itrace, ['drug_decay'])
     
