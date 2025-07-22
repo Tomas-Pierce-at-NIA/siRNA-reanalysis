@@ -13,6 +13,8 @@ import pymc as pm
 import pytensor as pt
 import numpy as np
 import xarray
+import matplotlib_venn as venn
+import itertools
 #from sklearn import metrics as skmetrics
 
 def load_data():
@@ -84,6 +86,8 @@ def load_data():
                                treat_idnum=pl.col('treatment').rank('dense').sub(1))
     return table
 
+    
+    
 
 if __name__ == '__main__':
     
@@ -160,19 +164,13 @@ if __name__ == '__main__':
         treat_idx = pm.Data('treat_idx', table['treat_idnum'])
         gene_idx = pm.Data('gene_idx', table['gene_idnum'])
         
-        # model each gene as starting from a similar but not identical baseline level at time 0
+        
         base_const = pm.Normal('base_const', mu=0, sigma=1)
-        gene_const = pm.Normal('gene_const', 
-                               mu=base_const, 
+        gene_const = pm.Normal('gene_const',
+                               mu=base_const,
                                sigma=1,
                                shape=len(gene_lookup),
                                dims=['gene'])
-
-        
-        # model starvation setting in on day 3, making the assumption that the 
-        # effect is approximately the same in linear terms
-        starve_effect = pm.Exponential('starve_effect', lam=1)
-        starve = pm.math.where(time > 2, starve_effect, 0)
         
         # model the effect of introducing the drugs at time 1 as similar within drugs
         # yet allowed to differ between genes in that structure
@@ -194,25 +192,21 @@ if __name__ == '__main__':
                                   dims=['treatment', 'gene'])
         interact = pm.math.where(time >= 1, interact_off[treat_idx, gene_idx], 0)
         
-        
         # we think that the drug should also act over time, but the drugs
         # have biological half-lives as they get metabolized and degraded.
         # thus the rate at which the drug can act must decline according to
         # an exponential decay e^(-kt)
-        # base_decay_log = pm.Laplace('base_decay_log',
-        #                             mu=0,
-        #                             b=1)
-        
-        drug_decay = pm.HalfNormal('drug_decay',
-                                   sigma=1,
-                                   shape=len(treat_lookup),
-                                   dims=['treatment'])
-        
-        # drug decay is assumed to not be influenced by silenced genes.
-        # attempts to explicitly model interaction here would bear this out,
-        # with the only reward for the attempts divergences during sampling
+        # search of literature reveals that the decay rate parameter we should
+        # expect for DMSO ~ 1.39 and for Fisetin, Quercetin ~ 4.75,
+        drug_decay_inner = pm.Laplace.dist(
+            mu=np.where(treat_lookup['treatment'] == 'DMSO', 1.39, 4.75),
+            b=0.1)
+        drug_decay = pm.Truncated('drug_decay',
+                                  dist=drug_decay_inner,
+                                  lower=0,
+                                  dims=['treatment'])
+        # drug decay rate is assumed to not be influenced by silenced genes.
         decay = drug_decay[treat_idx]
-        
         # exponential decay starts at moment drug is added,
         # so time input has to be shifted to accomodate
         timeshift = time - 1
@@ -237,7 +231,6 @@ if __name__ == '__main__':
                                              shape=(len(treat_lookup), len(gene_lookup)),
                                              dims=['treatment', 'gene'])
         time_eff = interact_effect[treat_idx, gene_idx]
-        
         # given an exponential decay of dose over time and a fixed
         # ratio between dose and effect, the cumulative effect is 
         # described by (-A/k)exp(-kt) +(A/k), which must be negated
@@ -246,9 +239,14 @@ if __name__ == '__main__':
         drug_cum_effect = (-time_eff/decay)*dose + (time_eff/decay)
         # always non-positive
         drug_over_time = pm.math.where(time >= 1, -drug_cum_effect, 0)
+
+        # model starvation setting in on day 3, making the assumption that the 
+        # effect is approximately the same in linear terms
+        starve_effect = pm.Exponential('starve_effect', lam=1)
+        starve = pm.math.where(time > 2, starve_effect, 0)
         
         
-        response = gene_const[gene_idx] - starve + interact + drug_over_time
+        response = gene_const[gene_idx] - starve + drug_over_time + interact
         ydata = pm.Data('ydata', table['scale_lum_delta'])
         tau = pm.Gamma('tau', alpha=5, beta=0.1)
         ylik = pm.Normal('ylik', mu=response, tau=tau, observed=ydata)
@@ -339,5 +337,238 @@ if __name__ == '__main__':
     pyplot.savefig('above_sictrl_const.svg', bbox_inches='tight')
     pyplot.show()
     
-    az.plot_posterior(itrace, ['drug_decay'])
+    az.plot_posterior(itrace,
+                      ['drug_decay'])
+    pyplot.savefig("drug_decay_posterior.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    az.plot_posterior(itrace, ['drug_off'])
+    pyplot.savefig('drug_off_posterior.svg', bbox_inches='tight')
+    pyplot.show()
+    
+    az.plot_posterior(itrace, 
+                      ['interact_off'],
+                      coords={'treatment': 'DMSO'},
+                      grid=(6,7))
+    pyplot.savefig('interact_off_dmso_posterior.svg', bbox_inches='tight')
+    pyplot.show()
+    
+    az.plot_posterior(itrace,
+                      ['interact_off'],
+                      coords={'treatment': 'Fisetin', 'gene': 'siCtrl'})
+    pyplot.title("Fisetin siCtrl interact_off", fontsize=20)
+    pyplot.savefig("interact_off_fisetin_sictrl_posterior.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    interact_off_tab = az.summary(itrace, ['interact_off'])
+    where_fisonly = interact_off_tab.index == 'interact_off[Fisetin, siCtrl]'
+    interact_fis_only = interact_off_tab.loc[where_fisonly]
+    interact_off_fis_lbound = interact_fis_only.iloc[0]['hdi_3%']
+    interact_off_fis_hbound = interact_fis_only.iloc[0]['hdi_97%']
+    
+    az.plot_posterior(itrace,
+                      ['interact_off'],
+                      coords={'treatment': 'Fisetin'},
+                      ref_val=interact_off_fis_hbound,
+                      grid=(6,7))
+    pyplot.savefig("interact_off_fisetin_above_sictrl_ubound.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    az.plot_posterior(itrace,
+                      ['interact_off'],
+                      coords={'treatment': 'Fisetin'},
+                      ref_val=interact_off_fis_lbound,
+                      grid=(6,7))
+    pyplot.savefig("interact_off_fisetin_below_sictrl_lbound.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    az.plot_posterior(itrace,
+                      ['drug_time_effect'])
+    pyplot.savefig("drug_time_effect_posterior.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    
+    az.plot_posterior(itrace,
+                      ['interact_off'],
+                      coords={'treatment': 'Quercetin', 'gene': 'siCtrl'})
+    pyplot.title("interact_off\nQuercetin siCtrl", fontsize=20)
+    pyplot.savefig("interact_off_quercetin_sictrl_posterior.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    where_queronly = interact_off_tab.index == 'interact_off[Quercetin, siCtrl]'
+    interact_quer_only = interact_off_tab.loc[where_queronly]
+    interact_off_quer_lbound = interact_quer_only.iloc[0]['hdi_3%']
+    interact_off_quer_hbound = interact_quer_only.iloc[0]['hdi_97%']
+    
+    az.plot_posterior(itrace,
+                      ['interact_off'],
+                      coords={'treatment': 'Quercetin'},
+                      ref_val=interact_off_quer_hbound,
+                      grid=(6,7))
+    pyplot.savefig("interact_off_quercetin_above_sictrl_ubound.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    az.plot_posterior(itrace,
+                      ['interact_off'],
+                      coords={'treatment': 'Quercetin'},
+                      ref_val=interact_off_quer_lbound,
+                      grid=(6,7))
+    pyplot.savefig("interact_off_quercetin_below_sictrl_lbound.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    az.plot_posterior(itrace,
+                      ['interact_effect'],
+                      coords={'treatment': ['DMSO', 'Fisetin', 'Quercetin'],
+                              'gene': 'siCtrl'})
+    pyplot.savefig("interact_effect_no_silence_posterior.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    interact_effect_tab = az.summary(itrace, ['interact_effect'])
+    where_queronly = interact_effect_tab.index == 'interact_effect[Quercetin, siCtrl]'
+    interact_effect_quer_only = interact_effect_tab.loc[where_queronly]
+    interact_effect_quer_lbound = interact_effect_quer_only.iloc[0]['hdi_3%']
+    interact_effect_quer_hbound = interact_effect_quer_only.iloc[0]['hdi_97%']
+    
+    az.plot_posterior(itrace,
+                      ['interact_effect'],
+                      coords={'treatment': 'Quercetin'},
+                      ref_val=interact_effect_quer_lbound,
+                      grid=(6,7))
+    pyplot.savefig("interact_effect_quercetin_below_sictrl_lbound.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    az.plot_posterior(itrace,
+                      ['interact_effect'],
+                      coords={'treatment': 'Quercetin'},
+                      ref_val=interact_effect_quer_hbound,
+                      grid=(6,7))
+    pyplot.savefig("interact_effect_quercetin_above_sictrl_ubound.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    axes_ = az.plot_forest(itrace, var_names=['interact_effect'], coords={'treatment': 'DMSO'})
+    axes_[0].set_title("94.0% HDI: DMSO")
+    pyplot.savefig("interact_effect_dmso_posterior_forest.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    axes_ = az.plot_forest(itrace, var_names=['interact_effect'], coords={'treatment': 'Fisetin'})
+    axes_[0].set_title("94.0% HDI: Fisetin")
+    pyplot.savefig("interact_effect_fisetin_posterior_forest.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    axes_ = az.plot_forest(itrace, var_names=['interact_effect'], coords={'treatment': 'Quercetin'})
+    axes_[0].set_title("94% HDI: Quercetin")
+    pyplot.savefig("interact_effect_quercetin_posterior_forest.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    
+    where_dmsoonly = interact_off_tab.index == 'interact_off[DMSO, siCtrl]'
+    interact_dmso_only = interact_off_tab.loc[where_dmsoonly]
+    interact_off_dmso_lbound = interact_dmso_only.iloc[0]['hdi_3%']
+    interact_off_dmso_hbound = interact_dmso_only.iloc[0]['hdi_97%']
+    az.plot_posterior(itrace, 
+                      ['interact_off'],
+                      coords={'treatment': 'DMSO'}, 
+                      grid=(6,7),
+                      ref_val=interact_off_dmso_hbound)
+    pyplot.savefig("interact_off_dmso_posterior_above_sictrl_ubound.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    az.plot_posterior(itrace,
+                      ['interact_off'],
+                      coords={'treatment':'DMSO'},
+                      grid=(6,7),
+                      ref_val=interact_off_dmso_lbound)
+    pyplot.savefig("interact_off_dmso_posterior_below_lbound.svg", bbox_inches='tight')
+    pyplot.show()
+    
+    
+    gene_const_sum = az.summary(itrace, ['gene_const'])
+    gene_const_control_lowbound = gene_const_sum.loc['gene_const[siCtrl]', 'hdi_3%']
+    gene_const_prob_below = (itrace.posterior['gene_const'] < 
+                             gene_const_control_lowbound).mean(('chain','draw'))
+    gene_const_table = gene_const_prob_below.to_dataframe()
+    gene_const_table = gene_const_table.rename(columns={'gene_const': 'prob_below_ctrl_hdi'})
+    
+    fisetin_interact_off_sum = az.summary(itrace, 
+                                          ['interact_off'], 
+                                          coords={'treatment': 'Fisetin'})
+    fis_interact_off_highbound = fisetin_interact_off_sum.loc['interact_off[siCtrl]', 'hdi_97%']
+    fis_interact_off_above = (itrace.posterior['interact_off'] > 
+                              fis_interact_off_highbound).mean(('chain', 'draw')).sel({'treatment': 'Fisetin'})
+    fis_interact_off_table = fis_interact_off_above.to_dataframe()
+    del fis_interact_off_table['treatment']
+    fis_interact_off_table = fis_interact_off_table.rename(columns={'interact_off': 'fis_prob_dstep_mag_smaller_hdi'})
+    
+    quer_interact_off_sum = az.summary(itrace,
+                                       ['interact_off'],
+                                       coords={'treatment': 'Quercetin'})
+    quer_interact_off_highbound = quer_interact_off_sum.loc['interact_off[siCtrl]', 'hdi_97%']
+    quer_interact_off_above = (itrace.posterior['interact_off'] >
+                               quer_interact_off_highbound).mean(('chain','draw')).sel({'treatment': 'Quercetin'})
+    quer_interact_off_table = quer_interact_off_above.to_dataframe()
+    del quer_interact_off_table['treatment']
+    quer_interact_off_table = quer_interact_off_table.rename(columns={'interact_off': 'quer_prob_dstep_mag_smaller_hdi'})
+    
+    all_deciders = gene_const_table.join(fis_interact_off_table).join(quer_interact_off_table)
+    all_deciders.to_csv("decision_probs.csv")
+    
+    sb.barplot(all_deciders, x='gene', y='prob_below_ctrl_hdi')
+    pyplot.ylabel("probability of gene being pro-survival")
+    pyplot.xticks(rotation=90)
+    pyplot.title("pro-survival probabilities")
+    pyplot.axhline(0.9)
+    pyplot.savefig("pro_survival_probs.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    sb.barplot(all_deciders, x='gene', y='fis_prob_dstep_mag_smaller_hdi')
+    pyplot.ylabel("probability of gene contributing to fisetin activity")
+    pyplot.xticks(rotation=90)
+    pyplot.title("fisetin involvement probabilities")
+    pyplot.axhline(0.9)
+    pyplot.savefig("fisetin_probs.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    sb.barplot(all_deciders, x='gene', y='quer_prob_dstep_mag_smaller_hdi')
+    pyplot.ylabel("probability of gene contributing to quercetin activity")
+    pyplot.xticks(rotation=90)
+    pyplot.title("quercetin involvement probabilities")
+    pyplot.axhline(0.9)
+    pyplot.savefig("quercetin_probs.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    
+    all_deciders['survival'] = all_deciders['prob_below_ctrl_hdi'] > 0.9
+    all_deciders['quercetin'] = all_deciders['fis_prob_dstep_mag_smaller_hdi'] > 0.9
+    all_deciders['fisetin'] = all_deciders['quer_prob_dstep_mag_smaller_hdi'] > 0.9
+    
+    surv_genes = set(all_deciders.loc[all_deciders['survival']].index)
+    quer_genes = set(all_deciders.loc[all_deciders['quercetin']].index)
+    fis_genes = set(all_deciders.loc[all_deciders['fisetin']].index)
+    
+    v3 = venn.venn3([surv_genes, quer_genes, fis_genes],
+                    set_labels=("survival", "quercetin", "fisetin"),
+                    layout_algorithm=venn.layout.venn3.DefaultLayoutAlgorithm(fixed_subset_sizes=(1,1,1,1,1,1,1))
+                    )
+    pyplot.savefig("overlap_size.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    
+    with pyplot.rc_context({'figure.figsize': [16,16]}):
+        v3 = venn.venn3([surv_genes, quer_genes, fis_genes],
+                        set_labels=("survival", "quercetin", "fisetin")#,
+                        #layout_algorithm=venn.layout.venn3.DefaultLayoutAlgorithm(fixed_subset_sizes=(1,1,1,1,1,1,1))
+                        )
+        v3.get_label_by_id('111').set_text('\n'.join(surv_genes&quer_genes&fis_genes))
+        v3.get_label_by_id('100').set_text('\n'.join(surv_genes-(quer_genes|fis_genes)))
+        v3.get_label_by_id('011').set_text('\n'.join((quer_genes&fis_genes)-surv_genes))
+        v3.get_label_by_id('010').set_text('\n'.join(quer_genes-(surv_genes|fis_genes)))
+        surv_quer = (quer_genes&surv_genes)-fis_genes
+        sq_pairs = itertools.batched(surv_quer, 2)
+        sq = map(lambda p: ", ".join(p), sq_pairs)
+        sq_name = "\n".join(sq)
+        v3.get_label_by_id('110').set_text(sq_name)
+        pyplot.savefig("overlap_members.svg", bbox_inches="tight")
+        pyplot.show()
+    
+    
     
