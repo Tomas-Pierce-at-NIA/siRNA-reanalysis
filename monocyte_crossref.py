@@ -215,10 +215,11 @@ if __name__ == '__main__':
         
         # we assume that effect of drug is proportional to dose,
         # but not 1:1 to it. denote A.
-        drug_time_effect = pm.Exponential('drug_time_effect',
-                                          lam=1,
-                                          shape=len(treat_lookup),
-                                          dims=['treatment'])
+        drug_time_effect = pm.Beta('drug_time_effect',
+                                   alpha=1,
+                                   beta=10,
+                                   shape=len(treat_lookup),
+                                   dims=['treatment'])
         # we wish to explicitly model that the silenced genes alter the
         # effectiveness of the drugs or not
         drug_time_expand = pm.Deterministic('drug_time_expand',
