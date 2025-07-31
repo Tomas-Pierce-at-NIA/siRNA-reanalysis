@@ -85,7 +85,7 @@ def load_data():
     # cannot rely on these genes to be silenced, so analyzing them at all is misleading
     table = table.filter(pl.col('gene_name').eq('CCDC174').not_() & 
                          pl.col('gene_name').eq('PHIP').not_() &
-                         pl.col('gene_name').eq('ATP5J').not_())
+                         pl.col('gene_name').eq('ATP5J2').not_())
     # DMSO gets introduced at time 1 same as the other drugs
     relabel_treat = table.select(
         treatment=pl.when(pl.col('time').eq(0)).then(pl.lit('untreated')).otherwise(pl.col('treatment'))
@@ -296,7 +296,7 @@ if __name__ == '__main__':
     pyplot.show()
     
     coord_pairs = itertools.product(range(4), range(10))
-    space = 8
+    space = 10
     fig, axes = pyplot.subplots(4, 10, figsize=(10 *space, 4 * space))
     gene_bfs = {}
     for gene_name in gene_lookup['gene_name']:
@@ -305,7 +305,8 @@ if __name__ == '__main__':
         ax = axes[row, col]
         bfs, ax_out = az.plot_bf(sub_genetrace, 'gene_const', ax=ax)
         gene_bfs[gene_name] = bfs
-        ax_out.set_xlabel(f"CSTD gene_const {gene_name}")
+        ax_out.set_xlabel(f"CSTD gene_const {gene_name}", fontsize=16)
+        ax_out.set_title(ax.get_title(), fontsize=20)
         #ax_out.get_legend().remove()
     pyplot.savefig("gene_viability_bayes_factors_plot.svg", bbox_inches="tight")
     pyplot.show()
@@ -333,6 +334,16 @@ if __name__ == '__main__':
     pyplot.savefig("gene_viability_tau_posterior.svg", bbox_inches="tight")
     pyplot.show()
     
+    controltab = table.filter(pl.col('treatment').eq('DMSO').or_(pl.col('treatment').eq('untreated'))
+                              ).filter(pl.col('gene_name').eq('siCtrl'))
+    control_med = controltab.select(pl.col('time'),
+                                    medlum=pl.col('luminescence').median().over(pl.col('time'))
+                                    ).unique()
+    table2 = table.join(control_med, on=pl.col('time')).with_columns(
+        fold_lum = pl.col('luminescence') / pl.col('medlum')
+        )
+    
+    
     dmso_idx = treat_lookup.filter(
         pl.col('treatment').eq('DMSO')
         ).select(pl.col('treat_idnum'))[0,0]
@@ -347,17 +358,128 @@ if __name__ == '__main__':
         ).select(pl.col('gene_idnum'))[0,0]
     
     with pm.Model(coords=coords) as step_model:
-        std_lum = pm.Data('std_lum', table['std_lum'])
-        gene_idx = pm.Data('gene_idx', table['gene_idnum'])
-        treat_idx = pm.Data('treat_idx', table['treat_idnum'])
-        time = pm.Data('time', table['time'])
+        std_lum = pm.Data('std_lum', table2['std_lum'])
+        gene_idx = pm.Data('gene_idx', table2['gene_idnum'])
+        treat_idx = pm.Data('treat_idx', table2['treat_idnum'])
+        time = pm.Data('time', table2['time'])
         
         base_const = pm.Normal('base_const', mu=0, sigma=1)
         gene_const = pm.Normal('gene_const',
-                               mu=0,
+                               mu=base_const,
                                sigma=1,
                                shape=len(gene_lookup),
                                dims=['gene'])
+        treat_step1 = pm.Normal('treat_step1',
+                               mu=0,
+                               sigma=1,
+                               shape=(len(treat_lookup),1),
+                               dims=['treatment', 'placeholder'])
+        interact_step1 = pm.Normal('interact_step1',
+                                   mu=treat_step1,
+                                   sigma=1,
+                                   shape=(len(treat_lookup), len(gene_lookup)),
+                                   dims=['treatment', 'gene'])
+        treat_step2 = pm.Normal('treat_step2',
+                                mu=0,
+                                sigma=1,
+                                shape=(len(treat_lookup),1),
+                                dims=['treatment', 'placeholder'])
+        interact_step2 = pm.Normal('interact_step2',
+                                   mu=treat_step2,
+                                   sigma=1,
+                                   shape=(len(treat_lookup), len(gene_lookup)),
+                                   dims=['treatment', 'gene'])
+        treat_step3 = pm.Normal('treat_step3',
+                                mu=0,
+                                sigma=1,
+                                shape=len(treat_lookup),
+                                dims=['treatment'])
         
+        gconst = gene_const[gene_idx]
+        treat_resp1 = pm.math.where(time >= 1, interact_step1[treat_idx, gene_idx], 0)
+        treat_resp2 = pm.math.where(time >= 2, interact_step2[treat_idx, gene_idx], 0)
+        treat_resp3 = pm.math.where(time >= 3, treat_step3[treat_idx], 0)
+        resp = gconst + treat_resp1 + treat_resp2 + treat_resp3
+        
+        tau = pm.Gamma('tau', alpha=50, beta=0.01)
+        
+        step_like = pm.Normal('step_like',
+                              mu = resp,
+                              tau=tau,
+                              observed = std_lum
+                              )
     
+    with step_model:
+        prior = pm.sample_prior_predictive()
+        step_itrace = pm.sample(draws=6000,
+                                nuts_sampler='blackjax',
+                                nuts={'target_accept': 0.95})
+        post = pm.sample_posterior_predictive(step_itrace)
+        like = pm.compute_log_likelihood(step_itrace)
+    
+    step_itrace.extend(prior)
+    step_itrace.extend(post)
+    
+    az.plot_loo_pit(step_itrace, 'step_like')
+    pyplot.title("step model LOO PIT")
+    pyplot.savefig("step_model_loo_pit.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    az.plot_ppc(step_itrace)
+    pyplot.title("step model PPC")
+    pyplot.savefig("step_model_ppc.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    az.plot_bpv(step_itrace, kind='p_value')
+    pyplot.title("step model bayesian P value")
+    pyplot.savefig("step_model_bayesian_pvalue.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    day1unsil = az.summary(step_itrace, 'interact_step1', coords={'gene': 'siCtrl'})
+    fisbounds = day1unsil.loc['interact_step1[Fisetin]', ['hdi_3%', 'hdi_97%']]
+    az.plot_posterior(step_itrace, 
+                      ['interact_step1'], 
+                      coords={'treatment': 'Fisetin'},
+                      rope=fisbounds,
+                      ref_val=0,
+                      grid=(6,7))
+    pyplot.savefig("day1_fisetin_posterior.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    dmsobounds = day1unsil.loc['interact_step1[DMSO]', ['hdi_3%', 'hdi_97%']]
+    az.plot_posterior(step_itrace,
+                      ['interact_step1'],
+                      coords={'treatment': 'DMSO'},
+                      rope=dmsobounds,
+                      ref_val=0,
+                      grid=(6,7))
+    pyplot.savefig("day1_dmso_posterior.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    querbounds = day1unsil.loc['interact_step1[Quercetin]', ['hdi_3%', 'hdi_97%']]
+    az.plot_posterior(step_itrace,
+                      ['interact_step1'],
+                      coords={'treatment': 'Quercetin'},
+                      rope=querbounds,
+                      ref_val=0,
+                      grid=(6,7))
+    pyplot.savefig("day1_quercetin_posterior.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    fis_diffs = step_itrace.sel(treatment='Fisetin').posterior - step_itrace.sel(treatment='DMSO').posterior
+    step_itrace.add_groups({'fis_diffs': fis_diffs})
+    day1diffsum = az.summary(step_itrace,
+                             ['interact_step1'],
+                             group='fis_diffs',
+                             coords={'gene': 'siCtrl'})
+    diffbounds = day1diffsum.loc['interact_step1', ['hdi_3%', 'hdi_97%']]
+    
+    az.plot_posterior(step_itrace,
+                      ['interact_step1'],
+                      group='fis_diffs',
+                      grid=(6,7),
+                      ref_val=0.0,
+                      rope=diffbounds)
+    pyplot.savefig("day1_fisetin_diff_step_posterior.svg", bbox_inches="tight")
+    pyplot.show()
     
