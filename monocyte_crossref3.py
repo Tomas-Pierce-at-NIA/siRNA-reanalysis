@@ -99,86 +99,209 @@ def load_data():
 
 def frequentist_treatment_impair(table):
     anova_table = []
-    dunnett_table = []
-    for day in range(1, 4):
+    dunnett_tables = []
+    days = table['time'].unique().sort()
+    for day in days:
         daytab = table.filter(pl.col('time').eq(day))
-        for gene in daytab['gene_name'].unique():
-            geneday = daytab.filter(pl.col('gene_name').eq(gene))
-            treatgroups = geneday.group_by(['treatment']).agg(pl.col('log_lum')).sort(pl.col('treatment'))
-            geneday_anova = scipy.stats.f_oneway(*treatgroups['log_lum'])
-            anova_row = {'day': day, 
-                         'gene': gene, 
-                         'anova_stat': geneday_anova.statistic,
-                         'anova_pvalue': geneday_anova.pvalue}
-            anova_table.append(anova_row)
-            if geneday_anova.pvalue <= 0.05:
-                dmso = treatgroups.filter(pl.col('treatment').eq('DMSO'))['log_lum'][0]
-                treatments = treatgroups.filter(pl.col('treatment').eq('DMSO').not_())
-                geneday_dunnett = scipy.stats.dunnett(*treatments['log_lum'], control=dmso)
-                dunnett_row0 = {'day': day,
-                               'gene': gene,
-                               'treatments': treatments['treatment'][0],
-                               'dunnett_stat': geneday_dunnett.statistic[0],
-                               'dunnett_pvalue': geneday_dunnett.pvalue[0]}
-                dunnett_row1 = {'day': day,
-                               'gene': gene,
-                               'treatments': treatments['treatment'][1],
-                               'dunnett_stat': geneday_dunnett.statistic[1],
-                               'dunnett_pvalue': geneday_dunnett.pvalue[1]}
-                dunnett_table.append(dunnett_row0)
-                dunnett_table.append(dunnett_row1)
+        daytreats = daytab.select(pl.col('treatment')).unique()
+        if len(daytreats) == 1:
+            continue
+        for treat in daytreats['treatment']:
+            daytreattab = daytab.filter(pl.col('treatment').eq(treat))
+            by_gene = daytreattab.group_by(['gene_name']).agg(pl.col('log_lum'))
+            not_silenced = by_gene.filter(pl.col('gene_name').eq('siCtrl'))
+            silenced = by_gene.filter(pl.col('gene_name').eq('siCtrl').not_())
+            intreat_anova = scipy.stats.f_oneway(*by_gene['log_lum'])
+            intreat_dunnett = scipy.stats.dunnett(*silenced['log_lum'],
+                                                  control=not_silenced['log_lum'][0],
+                                                  alternative='greater')
+            anova_table.append({'day': day, 
+                                'treatment': treat,
+                                'anova_statistic': intreat_anova.statistic,
+                                'anova_pvalue': intreat_anova.pvalue})
+            dunnett_tables.append({'day': [day] * len(silenced),
+                                   'treatment': [treat] * len(silenced),
+                                   'gene': silenced['gene_name'],
+                                   'dunnett_statistic': intreat_dunnett.statistic,
+                                   'dunnett_pvalue': intreat_dunnett.pvalue})
+    
     anova_ptable = pl.from_dicts(anova_table)
-    dunnett_ptable = pl.from_dicts(dunnett_table)
-    return anova_ptable, dunnett_ptable
+    dunnett_ptables = []
+    for dtab in dunnett_tables:
+        dunnett_ptable = pl.from_dict(dtab)
+        dunnett_ptables.append(dunnett_ptable)
+    dunnett_frame = pl.concat(dunnett_ptables)
+    return anova_ptable, dunnett_frame
+    
 
 
 def frequentist_genediff(table):
-    # gene comparisons are easyt
-    gene_only = table.filter(pl.col('time').eq(0)).group_by(['gene_name']).agg(pl.col('log_lum'))
-    gene_ctrl = gene_only.filter(pl.col('gene_name').eq('siCtrl'))
-    gene_test = gene_only.filter(pl.col('gene_name').eq('siCtrl').not_())
-    gene_anova = scipy.stats.f_oneway(*gene_only['log_lum'])
-    gene_dunnett = scipy.stats.dunnett(*gene_test['log_lum'], 
-                                       control=gene_ctrl['log_lum'][0], 
-                                       alternative='less')
-    gene_table = pl.from_dict({'gene': gene_test['gene_name'],
-                               'dunnett_pvalue': gene_dunnett.pvalue,
-                               'dunnett_stat': gene_dunnett.statistic})
-    return gene_table, gene_anova
+    anova_table = []
+    gene_tables = []
+    for day in table['time'].unique().sort():
+        daytab = table.filter(pl.col('time').eq(day))
+        genetab = daytab.filter(pl.col('treatment').eq('untreated').or_(
+            pl.col('treatment').eq('DMSO')))
+        gene_only = genetab.group_by(['gene_name']).agg(pl.col('log_lum'))
+        gene_ctrl = gene_only.filter(pl.col('gene_name').eq('siCtrl'))
+        gene_test = gene_only.filter(pl.col('gene_name').eq('siCtrl').not_())
+        gene_anova = scipy.stats.f_oneway(*gene_only['log_lum'])
+        gene_dunnett = scipy.stats.dunnett(*gene_test['log_lum'],
+                                           control=gene_ctrl['log_lum'][0],
+                                           alternative='less')
+        anova_table.append({'day': day, 
+                            'anova_stat': gene_anova.statistic,
+                            'anova_pvalue': gene_anova.pvalue})
+        gene_tables.append({'day': [day] * len(gene_test),
+                            'gene': gene_test['gene_name'],
+                            'dunnett_pvalue': gene_dunnett.pvalue,
+                            'dunnett_stat': gene_dunnett.statistic})
+    anova_ptable = pl.from_dicts(anova_table)
+    gene_ptables = []
+    for table in gene_tables:
+        gene_ptable = pl.from_dict(table)
+        gene_ptables.append(gene_ptable)
+    gene_ptable = pl.concat(gene_ptables)
+    return anova_ptable, gene_ptable
 
 
 def frequentist_analysis(table):
-    gene_table, gene_anova = frequentist_genediff(table)
-    print(gene_anova)
-    sb.barplot(gene_table, x='dunnett_pvalue', y='gene')
-    pyplot.xticks(rotation=90)
-    pyplot.axvline(0.05, color='red')
-    pyplot.savefig("gene_diff_frequentist.svg", bbox_inches="tight")
+    # general goal: identify genes which influence survival
+    gene_anovas, gene_table = frequentist_genediff(table)
+    # identify genes which are significantly affecting survival at more than 2 time points
+    sustained_surv_relevant = (gene_table
+                               .filter(
+                                   pl.col('dunnett_pvalue').lt(0.05)
+                                   )
+                               .group_by(
+                                   ['gene']
+                                   )
+                               .agg(
+                                   pl.col('dunnett_pvalue').count()
+                                   )
+                               .filter(
+                                   pl.col('dunnett_pvalue').gt(2)
+                                   ))
+    sustained_surv_relevant.write_csv("survival_relevant.csv")
+    surv_genes = set(sustained_surv_relevant['gene'])
+    sb.barplot(gene_anovas, x='day', y='anova_pvalue')
+    pyplot.title("gene anova by day")
+    pyplot.savefig("survival_day_anova.svg", bbox_inches="tight")
     pyplot.show()
-    anova2_table, dunnett2_table = frequentist_treatment_impair(table)
-    grid = sb.catplot(anova2_table,
-               x='anova_pvalue',
-               y='gene',
-               col='day',
-               kind='bar')
-    shape = grid.axes.shape
-    for i in range(shape[0]):
-        for j in range(shape[1]):
-            ax = grid.axes[i,j]
-            ax.axvline(0.20, color='blue')
-            ax.axvline(0.05, color='red')
-    pyplot.savefig("gene_treat_diff_detectable.svg", bbox_inches="tight")
+    cat = sb.catplot(gene_table, x='gene', y='dunnett_pvalue', col='day', kind='bar')
+    cat.set_xticklabels(rotation=90)
+    # bold survival relevant genes as previously identified
+    for ax in cat.axes.flat:
+        # hold tick position constant
+        ax_ticks = ax.get_xticks()
+        ax.set_xticks(ax_ticks)
+        # get the ax labels
+        ax_labels = ax.get_xticklabels()
+        for ticklabel in ax_labels:
+            ticktext = ticklabel.get_text()
+            if ticktext in surv_genes:
+                ticklabel.set_fontweight('bold')
+        ax.axhline(0.05, color='red')
+    pyplot.savefig("survival_daily_dunnett.svg", bbox_inches="tight")
     pyplot.show()
     
-    grid = sb.catplot(dunnett2_table,
-                      x='dunnett_pvalue',
-                      y='gene',
-                      col='day',
-                      row='treatments',
-                      kind='bar')
-    for ax in grid.axes.flat:
-        ax.axvline(0.05, color='red')
-    pyplot.savefig("post_hoc_diffs.svg", bbox_inches="tight")
+    impair_anova, impair_dunnett = frequentist_treatment_impair(table)
+    
+    drug_relevant = (impair_dunnett
+                     .filter(pl.col('dunnett_pvalue').lt(0.05))
+                     .group_by(['treatment', 'gene'])
+                     .agg(pl.col('dunnett_pvalue').count())
+                     .filter(pl.col('dunnett_pvalue').gt(1))
+                     )
+    
+    drug_relevant.write_csv("drug_relevant.csv")
+    
+    sb.barplot(impair_anova, x='day', y='anova_pvalue', hue='treatment')
+    pyplot.title("treatment anova by day")
+    pyplot.savefig("treatment_daily_anova.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    cat = sb.catplot(impair_dunnett, 
+                     x='gene', 
+                     y='dunnett_pvalue', 
+                     col='day', 
+                     row='treatment',
+                     kind='bar',
+                     sharex=False)
+    #cat.set_xticklabels(rotation=90)
+    cat.tick_params(axis='x', which='both', rotation=90)
+    for ax in cat.axes.flat:
+        ax.axhline(0.05, color='red')
+    for i,row_name in enumerate(cat.row_names):
+        relevant_genes = drug_relevant.filter(pl.col('treatment').eq(row_name))['gene']
+        drug_axes = cat.axes[i]
+        for ax in drug_axes:
+            for text in ax.get_xticklabels():
+                if text.get_text() in relevant_genes:
+                    text.set_fontweight('bold')
+    cat.fig.tight_layout()
+    pyplot.savefig("treatment_daily_dunnett.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    sustained_fisetin_relevant = drug_relevant.filter(pl.col('treatment').eq('Fisetin'))
+    fisetin_genes = set(sustained_fisetin_relevant['gene'])
+    sustained_quercetin_relevant = drug_relevant.filter(pl.col('treatment').eq('Quercetin'))
+    quercetin_genes = set(sustained_quercetin_relevant['gene'])
+    sustained_dmso_relevant = drug_relevant.filter(pl.col('treatment').eq('DMSO'))
+    dmso_genes = set(sustained_dmso_relevant['gene'])
+    
+    surv_only = surv_genes - (fisetin_genes | quercetin_genes)
+    surv_only_label = '\n'.join(map(lambda pair: '; '.join(pair),
+                                    itertools.batched(surv_only, 2)
+                                    )
+                                )
+    
+    fis_only = fisetin_genes - (surv_genes | quercetin_genes)
+    fisetin_only_label = '\n'.join(map(lambda pair: '; '.join(pair),
+                                       itertools.batched(fis_only, 2)
+                                       )
+                                   )
+    
+    fis_and_quer = (fisetin_genes & quercetin_genes) - surv_genes
+    fisandquer_label = '\n'.join(map(lambda pair: '; '.join(pair),
+                                     itertools.batched(fis_and_quer, 2)
+                                     )
+                                 )
+    
+    all_test_genes = set(table['gene_name'])
+    null_genes = all_test_genes - (surv_genes | fisetin_genes | quercetin_genes | dmso_genes | {'siCtrl'})
+    
+    fig, ax = pyplot.subplots()
+    fig.set_figwidth(15)
+    fig.set_figheight(15)
+    #pyplot.figure(fig, figsize=(10,10))
+    v_diag = venn.venn3((surv_genes, fisetin_genes, quercetin_genes),
+               ['Survival', 'Fisetin', 'Quercetin'],
+               ax=ax)
+    v_diag.get_label_by_id('100').set_text(surv_only_label)
+    v_diag.get_label_by_id('010').set_text(fisetin_only_label)
+    v_diag.get_label_by_id('011').set_text(fisandquer_label)
+    
+    v_diag.get_label_by_id('A').set_fontweight('bold')
+    v_diag.get_label_by_id('B').set_fontweight('bold')
+    v_diag.get_label_by_id('C').set_fontweight('bold')
+    
+    pyplot.text(0.5, 
+                0.0,
+                "No Detection\n" + '; '.join(null_genes), 
+                transform=ax.transAxes,
+                horizontalalignment='center')
+    
+    pyplot.text(0.0,
+                0.0,
+                "DMSO\n" + '; '.join(dmso_genes),
+                transform=ax.transAxes,
+                horizontalalignment='left')
+    
+    ax.set_title("siRNA Experiment Analysis Results Summary", 
+                 fontweight='bold',
+                 fontsize=20)
+    pyplot.savefig("frequentist_analysis_summary.svg", bbox_inches="tight")
     pyplot.show()
 
 
@@ -194,30 +317,14 @@ if __name__ == '__main__':
     treat_lookup = treat_lookup.sort(pl.col('treat_idnum'))
     coords = {'gene': gene_lookup['gene_name'], 
               'treatment': treat_lookup['treatment'],
-              'placeholder': ['placeholder']}
+              'placeholder': ['placeholder'],
+              'day': table['time'].unique().sort()}
     
-    dmso_idx = treat_lookup.filter(
-        pl.col('treatment').eq('DMSO')
-        ).select(pl.col('treat_idnum'))[0,0]
-    fisetin_idx = treat_lookup.filter(
-        pl.col('treatment').eq('Fisetin')
-        ).select(pl.col('treat_idnum'))[0,0]
-    quercetin_idx = treat_lookup.filter(
-        pl.col('treatment').eq('Quercetin')
-        ).select(pl.col('treat_idnum'))[0,0]
-    sictrl_idx = gene_lookup.filter(
-        pl.col('gene_name').eq('siCtrl')
-        ).select(pl.col('gene_idnum'))[0,0]
+    viewcontroltab = table.filter(pl.col('gene_name').eq('siCtrl').and_(
+        pl.col('treatment').eq('DMSO').or_(pl.col('treatment').eq('untreated'))
+        ))
     
-    
-    meanlog = table['luminescence'].log().mean()
-    stdlog = table['luminescence'].log().std()
-    
-    table = table.with_columns(
-        scale_lum_delta = (pl.col('luminescence').log() - meanlog) / stdlog
-        )
-    
-    sb.regplot(table.filter(pl.col('treatment').eq('DMSO').and_(pl.col('gene_name').eq('siCtrl'))),
+    sb.regplot(viewcontroltab,
                    x='time',
                    y='luminescence')
     pyplot.title("siCtrl + DMSO luminescence")
@@ -342,20 +449,6 @@ if __name__ == '__main__':
     table2 = table.join(control_med, on=pl.col('time')).with_columns(
         fold_lum = pl.col('luminescence') / pl.col('medlum')
         )
-    
-    
-    dmso_idx = treat_lookup.filter(
-        pl.col('treatment').eq('DMSO')
-        ).select(pl.col('treat_idnum'))[0,0]
-    fisetin_idx = treat_lookup.filter(
-        pl.col('treatment').eq('Fisetin')
-        ).select(pl.col('treat_idnum'))[0,0]
-    quercetin_idx = treat_lookup.filter(
-        pl.col('treatment').eq('Quercetin')
-        ).select(pl.col('treat_idnum'))[0,0]
-    sictrl_idx = gene_lookup.filter(
-        pl.col('gene_name').eq('siCtrl')
-        ).select(pl.col('gene_idnum'))[0,0]
     
     with pm.Model(coords=coords) as step_model:
         std_lum = pm.Data('std_lum', table2['std_lum'])
@@ -482,4 +575,34 @@ if __name__ == '__main__':
                       rope=diffbounds)
     pyplot.savefig("day1_fisetin_diff_step_posterior.svg", bbox_inches="tight")
     pyplot.show()
+    
+    quer_diffs = step_itrace.sel(treatment='Quercetin').posterior - step_itrace.sel(treatment='DMSO').posterior
+    step_itrace.add_groups({'quer_diffs': quer_diffs})
+    day1diffsum = az.summary(step_itrace,
+                             ['interact_step1'],
+                             group='quer_diffs',
+                             coords={'gene': 'siCtrl'})
+    diffbounds = day1diffsum.loc['interact_step1', ['hdi_3%', 'hdi_97%']]
+    az.plot_posterior(step_itrace,
+                      ['interact_step1'],
+                      group='quer_diffs',
+                      grid=(6,7),
+                      ref_val=0.0,
+                      rope=diffbounds)
+    pyplot.show()
+    
+    day2diffsum = az.summary(step_itrace,
+                             ['interact_step2'],
+                             group='fis_diffs',
+                             coords={'gene': 'siCtrl'})
+    diffbounds = day2diffsum.loc['interact_step2', ['hdi_3%', 'hdi_97%']]
+    az.plot_posterior(step_itrace,
+                      ['interact_step2'],
+                      group='fis_diffs',
+                      grid=(6,7),
+                      ref_val=0.0,
+                      rope=diffbounds)
+    pyplot.savefig("day2_fisetin_diff_step_posterior.svg", bbox_inches="tight")
+    pyplot.show()
+    
     
