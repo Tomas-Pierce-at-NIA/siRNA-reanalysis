@@ -298,6 +298,12 @@ def frequentist_analysis(table):
                 transform=ax.transAxes,
                 horizontalalignment='left')
     
+    pyplot.text(1.0,
+                0.0,
+                "Not Testable\nPHIP; ATP5J2; CCDC174",
+                transform=ax.transAxes,
+                horizontalalignment='center')
+    
     ax.set_title("siRNA Experiment Analysis Results Summary", 
                  fontweight='bold',
                  fontsize=20)
@@ -309,8 +315,6 @@ def frequentist_analysis(table):
 if __name__ == '__main__':
     
     table = load_data()
-    #breakpoint()
-    table = table.with_columns(time2=pl.col('time').pow(2))
     gene_lookup = table.select(pl.col('gene_idnum'),pl.col('gene_name')).unique()
     gene_lookup = gene_lookup.sort(pl.col('gene_idnum'))
     treat_lookup = table.select(pl.col('treat_idnum'), pl.col('treatment')).unique()
@@ -330,279 +334,123 @@ if __name__ == '__main__':
     pyplot.title("siCtrl + DMSO luminescence")
     pyplot.savefig('control_luminescence.svg')
     pyplot.show()
-    
-    
-    table = table.with_columns(
-        mm_lum=(pl.col('luminescence') - pl.col('luminescence').min())/
-        (pl.col('luminescence').max() - pl.col('luminescence').min()),
-        log_lum = pl.col('luminescence').log(base=2),
-        log_time = pl.col('time').log1p() / np.log(2),
-        std_lum=(pl.col('luminescence') - pl.col('luminescence').mean())/pl.col('luminescence').std(),
-        )
-    
+    table = table.with_columns(log_lum = pl.col('luminescence').log(base=2))
     frequentist_analysis(table)
-    
-    table0 = table.filter(pl.col('time').eq(0))
-    control0 = table0.filter(pl.col('treatment').eq('untreated').and_(pl.col('gene_name').eq('siCtrl')))
-    control0mean = control0.select(pl.col('luminescence').mean())[0,0]
-    control0std = control0.select(pl.col('luminescence').std())[0,0]
-    table0 = table0.with_columns(cstd_lum = (pl.col('luminescence') - control0mean) / control0std)
-    
-    with pm.Model(coords=coords) as gene_only_model:
-        std_luminescence = pm.Data('cstd_luminescence', table0['cstd_lum'])
-        gene_idx = pm.Data('gene_idx', table0['gene_idnum'])
-        base_const = pm.Normal('base_const',
-                               mu=0,
-                               sigma=1)
-        gene_const = pm.Normal('gene_const',
-                               mu=base_const,
+    table2 = table.with_columns(std_lum = (pl.col('luminescence') - pl.col('luminescence').mean())/pl.col('luminescence').std())
+    table_nodrug = (table2
+                    .filter(
+                        pl.col('treatment').eq('DMSO') |
+                        pl.col('treatment').eq('untreated')
+                        )
+                    )
+    sictrl_idx = gene_lookup.filter(pl.col('gene_name').eq('siCtrl'))['gene_idnum'][0]
+    with pm.Model(coords=coords) as nodrug_model:
+        std_lum = pm.Data('std_lum', table_nodrug['std_lum'])
+        time = pm.Data('time', table_nodrug['time'])
+        gene_idx = pm.Data('gene_idx', table_nodrug['gene_idnum'])
+        baseline = pm.Normal('baseline', mu=0, sigma=1)
+        gene_level = pm.Normal('gene_level',
+                               mu=baseline,
                                sigma=1,
-                               shape=len(gene_lookup),
-                               dims=['gene'])
-        gconst = gene_const[gene_idx]
-        
-        tau = pm.Gamma('tau', alpha=50, beta=0.01)
-        
-        like = pm.Normal('like',
-                         mu=gconst,
-                         tau=tau,
-                         observed=std_luminescence)
-    
-    with gene_only_model:
-        gene_prior = pm.sample_prior_predictive()
-        gene_itrace = pm.sample(draws=6000,
-                           nuts_sampler='blackjax',
-                           nuts={'target_accept': 0.95})
-        gene_pp = pm.sample_posterior_predictive(gene_itrace)
-        gene_loglike = pm.compute_log_likelihood(gene_itrace)
-    gene_itrace.extend(gene_prior)
-    gene_itrace.extend(gene_pp)
-    
-    az.plot_energy(gene_itrace)
-    pyplot.title("Gene Viability Energy Diagnostic")
-    pyplot.savefig("gene_viability_energy_diagnostic.svg", bbox_inches="tight")
-    pyplot.show()
-    az.plot_ppc(gene_itrace)
-    pyplot.title("Gene Viability PPC Plot")
-    pyplot.xlabel("CSTD Gene Viability (luminescence)")
-    pyplot.ylabel("Probability Density")
-    pyplot.savefig('gene_viability_ppc_plot.svg', bbox_inches="tight")
-    pyplot.show()
-    az.plot_loo_pit(gene_itrace, 'like')
-    pyplot.title("Gene Viability LOO PIT Plot")
-    pyplot.savefig('gene_viability_loo_pit_plot.svg', bbox_inches="tight")
-    pyplot.show()
-    az.plot_bpv(gene_itrace)
-    pyplot.title("Gene Viability Bayesian u Value Plot")
-    pyplot.savefig("gene_viability_bayesian_uvalue_plot.svg", bbox_inches="tight")
-    pyplot.show()
-    az.plot_bpv(gene_itrace, kind='p_value')
-    pyplot.title("Gene Viability Bayesian p Value Plot")
-    pyplot.xlabel("Overprediction Probability")
-    pyplot.savefig('gene_viability_bayesian_pvalue_plot.svg', bbox_inches='tight')
-    pyplot.show()
-    
-    coord_pairs = itertools.product(range(4), range(10))
-    space = 10
-    fig, axes = pyplot.subplots(4, 10, figsize=(10 *space, 4 * space))
-    gene_bfs = {}
-    for gene_name in gene_lookup['gene_name']:
-        sub_genetrace = gene_itrace.sel(gene = gene_name)
-        row, col = next(coord_pairs)
-        ax = axes[row, col]
-        bfs, ax_out = az.plot_bf(sub_genetrace, 'gene_const', ax=ax)
-        gene_bfs[gene_name] = bfs
-        ax_out.set_xlabel(f"CSTD gene_const {gene_name}", fontsize=16)
-        ax_out.set_title(ax.get_title(), fontsize=20)
-        #ax_out.get_legend().remove()
-    pyplot.savefig("gene_viability_bayes_factors_plot.svg", bbox_inches="tight")
-    pyplot.show()
-    
-    az.plot_posterior(gene_itrace, 
-                      ['gene_const'],
-                      ref_val=0,
-                      rope=(-2,2),
-                      grid=(4,10))
-    pyplot.savefig("gene_viability_posterior_comparison.svg", bbox_inches="tight")
-    pyplot.show()
-    
-    gene_only_graph = gene_only_model.to_graphviz()
-    gene_only_graph.render("gene_viability_modeling.gv", format="svg")
-    
-    az.plot_trace(gene_itrace)
-    pyplot.savefig("gene_viability_traceplot.png", bbox_inches="tight")
-    pyplot.show()
-    
-    az.plot_posterior(gene_itrace, ['base_const'])
-    pyplot.savefig("gene_viability_base_const_posterior.svg", bbox_inches="tight")
-    pyplot.show()
-    
-    az.plot_posterior(gene_itrace, ['tau'])
-    pyplot.savefig("gene_viability_tau_posterior.svg", bbox_inches="tight")
-    pyplot.show()
-    
-    controltab = table.filter(pl.col('treatment').eq('DMSO').or_(pl.col('treatment').eq('untreated'))
-                              ).filter(pl.col('gene_name').eq('siCtrl'))
-    control_med = controltab.select(pl.col('time'),
-                                    medlum=pl.col('luminescence').median().over(pl.col('time'))
-                                    ).unique()
-    table2 = table.join(control_med, on=pl.col('time')).with_columns(
-        fold_lum = pl.col('luminescence') / pl.col('medlum')
-        )
-    
-    with pm.Model(coords=coords) as step_model:
-        std_lum = pm.Data('std_lum', table2['std_lum'])
-        gene_idx = pm.Data('gene_idx', table2['gene_idnum'])
-        treat_idx = pm.Data('treat_idx', table2['treat_idnum'])
-        time = pm.Data('time', table2['time'])
-        
-        base_const = pm.Normal('base_const', mu=0, sigma=1)
-        gene_const = pm.Normal('gene_const',
-                               mu=base_const,
-                               sigma=1,
-                               shape=len(gene_lookup),
-                               dims=['gene'])
-        treat_step1 = pm.Normal('treat_step1',
-                               mu=0,
-                               sigma=1,
-                               shape=(len(treat_lookup),1),
-                               dims=['treatment', 'placeholder'])
-        interact_step1 = pm.Normal('interact_step1',
-                                   mu=treat_step1,
+                               shape=(len(gene_lookup), 1),
+                               dims=['gene', 'placeholder'])
+        gene_day_level = pm.Normal('gene_day_level',
+                                   mu=gene_level,
                                    sigma=1,
-                                   shape=(len(treat_lookup), len(gene_lookup)),
-                                   dims=['treatment', 'gene'])
-        treat_step2 = pm.Normal('treat_step2',
-                                mu=0,
-                                sigma=1,
-                                shape=(len(treat_lookup),1),
-                                dims=['treatment', 'placeholder'])
-        interact_step2 = pm.Normal('interact_step2',
-                                   mu=treat_step2,
-                                   sigma=1,
-                                   shape=(len(treat_lookup), len(gene_lookup)),
-                                   dims=['treatment', 'gene'])
-        treat_step3 = pm.Normal('treat_step3',
-                                mu=0,
-                                sigma=1,
-                                shape=len(treat_lookup),
-                                dims=['treatment'])
-        
-        gconst = gene_const[gene_idx]
-        treat_resp1 = pm.math.where(time >= 1, interact_step1[treat_idx, gene_idx], 0)
-        treat_resp2 = pm.math.where(time >= 2, interact_step2[treat_idx, gene_idx], 0)
-        treat_resp3 = pm.math.where(time >= 3, treat_step3[treat_idx], 0)
-        resp = gconst + treat_resp1 + treat_resp2 + treat_resp3
-        
-        tau = pm.Gamma('tau', alpha=50, beta=0.01)
-        
-        step_like = pm.Normal('step_like',
-                              mu = resp,
-                              tau=tau,
-                              observed = std_lum
-                              )
+                                   shape=(len(gene_lookup), 4),
+                                   dims=['gene', 'day'])
+        control_level = pm.Deterministic('control_level',
+                                         gene_day_level[sictrl_idx, :],
+                                         dims=['day'])
+        diff = pm.Deterministic('diff',
+                               gene_day_level - control_level[np.newaxis, :],
+                               dims=['gene', 'day'])
+        tau = pm.Gamma('tau', alpha=100, beta=0.1)
+        level = pm.Normal('level',
+                          mu=gene_day_level[gene_idx, time],
+                          tau=tau,
+                          observed=std_lum)
     
-    with step_model:
+    with nodrug_model:
         prior = pm.sample_prior_predictive()
-        step_itrace = pm.sample(draws=6000,
-                                nuts_sampler='blackjax',
-                                nuts={'target_accept': 0.95})
-        post = pm.sample_posterior_predictive(step_itrace)
-        like = pm.compute_log_likelihood(step_itrace)
+        nodrug_itrace = pm.sample(draws=6000,
+                                  nuts_sampler='blackjax',
+                                  nuts={'target_accept': 0.95})
+        post = pm.sample_posterior_predictive(nodrug_itrace)
+        like = pm.compute_log_likelihood(nodrug_itrace)
+    nodrug_itrace.extend(prior)
+    nodrug_itrace.extend(post)
     
-    step_itrace.extend(prior)
-    step_itrace.extend(post)
+    nodrug_graph = nodrug_model.to_graphviz()
+    nodrug_graph.render('nodrug_graph.gv', format='svg')
     
-    az.plot_loo_pit(step_itrace, 'step_like')
-    pyplot.title("step model LOO PIT")
-    pyplot.savefig("step_model_loo_pit.svg", bbox_inches="tight")
+    # Confirming that the model makes sense
+    az.plot_energy(nodrug_itrace)
+    pyplot.title("Energy Diagnostic - Silencing Only")
+    pyplot.savefig("energy_silence_only.svg", bbox_inches="tight")
+    pyplot.show()
+    az.plot_ppc(nodrug_itrace)
+    pyplot.title("Posterior Predictive Check - Silencing Only")
+    pyplot.savefig("ppc_silence_only.svg", bbox_inches="tight")
+    pyplot.show()
+    az.plot_loo_pit(nodrug_itrace, 'level')
+    pyplot.title("LOO-PIT - Silencing Only")
+    pyplot.savefig("loo_pit_silence_only.svg", bbox_inches="tight")
+    pyplot.show()
+    az.plot_bpv(nodrug_itrace, 'p_value')
+    pyplot.title("BPV - Silencing Only")
+    pyplot.savefig("bpv_silence_only.svg", bbox_inches="tight")
     pyplot.show()
     
-    az.plot_ppc(step_itrace)
-    pyplot.title("step model PPC")
-    pyplot.savefig("step_model_ppc.svg", bbox_inches="tight")
-    pyplot.show()
-    
-    az.plot_bpv(step_itrace, kind='p_value')
-    pyplot.title("step model bayesian P value")
-    pyplot.savefig("step_model_bayesian_pvalue.svg", bbox_inches="tight")
-    pyplot.show()
-    
-    day1unsil = az.summary(step_itrace, 'interact_step1', coords={'gene': 'siCtrl'})
-    fisbounds = day1unsil.loc['interact_step1[Fisetin]', ['hdi_3%', 'hdi_97%']]
-    az.plot_posterior(step_itrace, 
-                      ['interact_step1'], 
-                      coords={'treatment': 'Fisetin'},
-                      rope=fisbounds,
+    tested_genes = gene_lookup.filter(pl.col('gene_name').eq('siCtrl').not_())['gene_name']
+    control_levels = az.summary(nodrug_itrace, ['control_level'])
+    az.plot_posterior(nodrug_itrace,
+                      ['diff'],
+                      coords={'day': 0, 
+                              'gene': tested_genes},
                       ref_val=0,
-                      grid=(6,7))
-    pyplot.savefig("day1_fisetin_posterior.svg", bbox_inches="tight")
+                      grid=(4,10))
     pyplot.show()
-    
-    dmsobounds = day1unsil.loc['interact_step1[DMSO]', ['hdi_3%', 'hdi_97%']]
-    az.plot_posterior(step_itrace,
-                      ['interact_step1'],
-                      coords={'treatment': 'DMSO'},
-                      rope=dmsobounds,
+    az.plot_posterior(nodrug_itrace,
+                      ['diff'],
+                      coords={'day': 1, 
+                              'gene': tested_genes},
                       ref_val=0,
-                      grid=(6,7))
-    pyplot.savefig("day1_dmso_posterior.svg", bbox_inches="tight")
+                      grid=(4,10))
     pyplot.show()
-    
-    querbounds = day1unsil.loc['interact_step1[Quercetin]', ['hdi_3%', 'hdi_97%']]
-    az.plot_posterior(step_itrace,
-                      ['interact_step1'],
-                      coords={'treatment': 'Quercetin'},
-                      rope=querbounds,
+    az.plot_posterior(nodrug_itrace,
+                      ['diff'],
+                      coords={'day': 2, 
+                              'gene': tested_genes},
                       ref_val=0,
-                      grid=(6,7))
-    pyplot.savefig("day1_quercetin_posterior.svg", bbox_inches="tight")
+                      grid=(4,10))
     pyplot.show()
-    
-    fis_diffs = step_itrace.sel(treatment='Fisetin').posterior - step_itrace.sel(treatment='DMSO').posterior
-    step_itrace.add_groups({'fis_diffs': fis_diffs})
-    day1diffsum = az.summary(step_itrace,
-                             ['interact_step1'],
-                             group='fis_diffs',
-                             coords={'gene': 'siCtrl'})
-    diffbounds = day1diffsum.loc['interact_step1', ['hdi_3%', 'hdi_97%']]
-    
-    az.plot_posterior(step_itrace,
-                      ['interact_step1'],
-                      group='fis_diffs',
-                      grid=(6,7),
-                      ref_val=0.0,
-                      rope=diffbounds)
-    pyplot.savefig("day1_fisetin_diff_step_posterior.svg", bbox_inches="tight")
+    az.plot_posterior(nodrug_itrace,
+                      ['diff'],
+                      coords={'day': 3, 
+                              'gene': tested_genes},
+                      ref_val=0,
+                      grid=(4,10))
     pyplot.show()
-    
-    quer_diffs = step_itrace.sel(treatment='Quercetin').posterior - step_itrace.sel(treatment='DMSO').posterior
-    step_itrace.add_groups({'quer_diffs': quer_diffs})
-    day1diffsum = az.summary(step_itrace,
-                             ['interact_step1'],
-                             group='quer_diffs',
-                             coords={'gene': 'siCtrl'})
-    diffbounds = day1diffsum.loc['interact_step1', ['hdi_3%', 'hdi_97%']]
-    az.plot_posterior(step_itrace,
-                      ['interact_step1'],
-                      group='quer_diffs',
-                      grid=(6,7),
-                      ref_val=0.0,
-                      rope=diffbounds)
+    # compute probability that the magnitude of viability drop under silencing
+    # exceeds the baseline viability drop over time
+    below_baseline_daily_probs = (nodrug_itrace.posterior['diff'] < 0).mean(('chain', 'draw'))
+    # subsequent days occur in the context that the events of the previous days occurred,
+    # that is they are not independent, and the probability obeys 
+    # P(event of day N AND event of day N + 1) = P(event of day N) * P(event of day N + 1 | event of day N)
+    # it is also the case that the probability we calculate for the subsequent days is
+    # the conditional probability, not the marginal probability, so we can multiply out
+    below_baseline_probs = below_baseline_daily_probs.prod(('day'))
+    ax = sb.barplot(x=below_baseline_probs.gene, y=below_baseline_probs.data)
+    pyplot.axhline(0.90, color='green')
+    pyplot.xticks(rotation=90)
+    pyplot.ylabel("Probability of sustained survival impact")
+    pyplot.title("Survival Implication - Bayesian")
+    xlabels = ax.get_xticklabels()
+    for xlab in xlabels:
+        gene = xlab.get_text()
+        prob = float(below_baseline_probs.sel(gene=gene))
+        if prob > 0.90:
+            xlab.set_fontweight('bold')
+    pyplot.savefig("semi_bayesian_survival.svg", bbox_inches="tight")
     pyplot.show()
-    
-    day2diffsum = az.summary(step_itrace,
-                             ['interact_step2'],
-                             group='fis_diffs',
-                             coords={'gene': 'siCtrl'})
-    diffbounds = day2diffsum.loc['interact_step2', ['hdi_3%', 'hdi_97%']]
-    az.plot_posterior(step_itrace,
-                      ['interact_step2'],
-                      group='fis_diffs',
-                      grid=(6,7),
-                      ref_val=0.0,
-                      rope=diffbounds)
-    pyplot.savefig("day2_fisetin_diff_step_posterior.svg", bbox_inches="tight")
-    pyplot.show()
-    
-    
