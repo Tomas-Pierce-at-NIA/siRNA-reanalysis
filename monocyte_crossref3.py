@@ -11,11 +11,10 @@ import seaborn as sb
 import arviz as az
 from matplotlib import pyplot
 import pymc as pm
-import pytensor as pt
 import numpy as np
-import xarray
 import matplotlib_venn as venn
 import itertools
+import re
 #from sklearn import metrics as skmetrics
 
 def load_data():
@@ -250,11 +249,18 @@ def frequentist_analysis(table):
     sustained_dmso_relevant = drug_relevant.filter(pl.col('treatment').eq('DMSO'))
     dmso_genes = set(sustained_dmso_relevant['gene'])
     
+    controls = ['PPP1R12C', 'FMNL3']
+    
     surv_only = surv_genes - (fisetin_genes | quercetin_genes)
     surv_only_label = '\n'.join(map(lambda pair: '; '.join(pair),
-                                    itertools.batched(surv_only, 2)
+                                    itertools.batched(filter(
+                                        lambda name : name not in controls,
+                                        surv_only
+                                        ), 2)
                                     )
                                 )
+    if all(map(lambda c : c in surv_only, controls)):
+        surv_only_label = '{}\n\nControls:\n{}'.format(surv_only_label, controls)
     
     fis_only = fisetin_genes - (surv_genes | quercetin_genes)
     fisetin_only_label = '\n'.join(map(lambda pair: '; '.join(pair),
@@ -447,10 +453,312 @@ if __name__ == '__main__':
     pyplot.ylabel("Probability of sustained survival impact")
     pyplot.title("Survival Implication - Bayesian")
     xlabels = ax.get_xticklabels()
+    
+    bayesian_survival_implicated = set()
+    
     for xlab in xlabels:
         gene = xlab.get_text()
         prob = float(below_baseline_probs.sel(gene=gene))
         if prob > 0.90:
             xlab.set_fontweight('bold')
+            bayesian_survival_implicated.add(gene)
     pyplot.savefig("semi_bayesian_survival.svg", bbox_inches="tight")
     pyplot.show()
+    
+    nodrug_bayes_factors = {}
+    figscale = 8
+    for day in coords['day']:
+        nodrug_bayes_factors[day] = {}
+        fig, axes = pyplot.subplots(6, 7, figsize=(7 * figscale, 6 * figscale))
+        for i, gene in enumerate(gene_lookup['gene_name']):
+            ax = axes.flat[i]
+            subtrace = nodrug_itrace.sel(day=day, gene=gene)
+            bf_dict, out_ax = az.plot_bf(subtrace, 'diff', ax=ax)
+            nodrug_bayes_factors[day][gene] = bf_dict
+            ax.set_xlabel("diff {} day {}".format(gene, day))
+        pyplot.savefig("day_{}_survival_bayes_factors.svg", bbox_inches="tight")
+        pyplot.show()
+    
+    nodrug_genesum = az.summary(nodrug_itrace, ['gene_level'], coords={'gene': 'siCtrl'})
+    control_hdibounds = list(nodrug_genesum.loc['gene_level[placeholder]', 
+                                           ['hdi_3%', 'hdi_97%']])
+    control_mean = nodrug_genesum.loc['gene_level[placeholder]', 'mean']
+    az.plot_posterior(nodrug_itrace,
+                      ['gene_level'],
+                      coords={'placeholder': 'placeholder'},
+                      rope=control_hdibounds,
+                      ref_val=control_mean,
+                      grid=(6,7))
+    pyplot.savefig("gene_level_posteriors.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    fis_idx = (treat_lookup
+               .filter(
+                   pl.col('treatment').eq('Fisetin')
+                   )
+               .select(pl.col('treat_idnum'))
+               )[0,0]
+    quer_idx = (treat_lookup
+               .filter(
+                   pl.col('treatment').eq('Quercetin')
+                   )
+               .select(pl.col('treat_idnum'))
+               )[0,0]
+    
+    # not using day 0 data because no drug treatment conditions measured 
+    # on day 0
+    treat_table = (table2
+                   .filter(
+                       pl.col('time').gt(0) &
+                       pl.col('treatment').eq('untreated').not_()
+                       )
+                   )
+    coords2 = dict(coords)
+    coords2['day'] = list(filter(lambda x : x > 0, coords['day']))
+    coords2['treatment'] = list(filter(lambda x : x != 'untreated', coords['treatment']))
+    treat_lookup2 = treat_lookup.filter(pl.col('treatment').eq('untreated').not_())
+    
+    with pm.Model(coords=coords2) as drug_model:
+        std_lum = pm.Data('std_lum', treat_table['std_lum'])
+        # need to convert from times to offsets
+        time = pm.Data('time', treat_table['time'] - 1)
+        gene_idx = pm.Data('gene_idx', treat_table['gene_idnum'])
+        treat_idx = pm.Data('treat_idx', treat_table['treat_idnum'])
+
+        post_baseline = pm.Normal('post_baseline', mu=0, sigma=1)
+        drug_base = pm.Normal('drug_base', 
+                              mu=post_baseline, 
+                              sigma=1,
+                              shape=len(treat_lookup2),
+                              dims=['treatment'])
+        interact = pm.Normal('interact',
+                             mu=drug_base[:, np.newaxis],
+                             sigma=1,
+                             shape=(len(treat_lookup2), len(gene_lookup)),
+                             dims=['treatment', 'gene'])
+        interact_day = pm.Normal('interact_day',
+                                 mu=interact[..., np.newaxis],
+                                 sigma=1,
+                                 shape=(len(treat_lookup2), len(gene_lookup), 3),
+                                 dims=['treatment', 'gene', 'day'])
+        
+        resp = interact_day[treat_idx, gene_idx, time]
+        tau = pm.Gamma('tau', alpha=100, beta=0.1)
+        level = pm.Normal('level',
+                          mu=resp,
+                          tau=tau,
+                          observed=std_lum)
+        
+        fis_line = pm.Deterministic('fis_line',
+                                    interact_day[fis_idx, sictrl_idx],
+                                    dims=['day'])
+        quer_line = pm.Deterministic('quer_line',
+                                    interact_day[quer_idx, sictrl_idx],
+                                    dims=['day'])
+        
+        fis_diff = pm.Deterministic('fis_diff',
+                                  interact_day[fis_idx] - fis_line[np.newaxis, :],
+                                  dims=['gene', 'day'])
+        
+        quer_diff = pm.Deterministic('quer_diff',
+                                     interact_day[quer_idx] - quer_line[np.newaxis, :],
+                                     dims=['gene', 'day'])
+    
+    
+    with drug_model:
+        prior = pm.sample_prior_predictive()
+        drug_itrace = pm.sample(draws=6000,
+                                  nuts_sampler='blackjax',
+                                  nuts={'target_accept': 0.95})
+        post = pm.sample_posterior_predictive(drug_itrace)
+        like = pm.compute_log_likelihood(drug_itrace)
+    drug_itrace.extend(prior)
+    drug_itrace.extend(post)
+    
+    drug_graph = drug_model.to_graphviz()
+    drug_graph.render('drug_model.gv', format='svg')
+    
+    az.plot_energy(drug_itrace)
+    pyplot.title("Drug model energy diagnostic")
+    pyplot.savefig("drug_energy_diag.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    az.plot_loo_pit(drug_itrace, 'level')
+    pyplot.title("LOO PIT plot for drug model")
+    pyplot.savefig("loo_pit_drug.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    az.plot_ppc(drug_itrace)
+    pyplot.title("Drug PPC plot")
+    pyplot.savefig("drug_ppc.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    az.plot_bpv(drug_itrace, 'p_value')
+    pyplot.title("Drug Bayesian P Value")
+    pyplot.savefig("drug_bayesian_p_val.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    # treated conditions aren't measured on day 0
+    
+    az.plot_posterior(drug_itrace, 
+                      ['fis_diff'], 
+                      coords={'day': 1, 'gene': tested_genes},
+                      grid=(6,7),
+                      ref_val=0)
+    pyplot.show()
+    az.plot_posterior(drug_itrace, 
+                      ['fis_diff'], 
+                      coords={'day': 2, 'gene': tested_genes},
+                      grid=(6,7),
+                      ref_val=0)
+    pyplot.show()
+    az.plot_posterior(drug_itrace, 
+                      ['fis_diff'], 
+                      coords={'day': 3, 'gene': tested_genes},
+                      grid=(6,7),
+                      ref_val=0)
+    pyplot.show()
+    
+    drug_bayes_factors = {}
+    drug_bayes_factors['Fisetin'] = {}
+    for day in coords2['day']:
+        drug_bayes_factors['Fisetin'][day] = {}
+        fig, axes = pyplot.subplots(6, 7, figsize=(7 * figscale, 6 * figscale))
+        for i, gene in enumerate(gene_lookup['gene_name']):
+            ax = axes.flat[i]
+            subtrace = drug_itrace.sel(treatment='Fisetin',
+                                       day=day,
+                                       gene=gene)
+            bf, out_ax = az.plot_bf(subtrace, ['fis_diff'], ax=ax)
+            drug_bayes_factors['Fisetin'][day][gene] = bf
+            ax.set_xlabel("fis diff {} day {}".format(gene, day))
+        pyplot.savefig("fisetin_diffs_day_{}_posterior.svg".format(day), bbox_inches="tight")
+        pyplot.show()
+    
+    drug_bayes_factors['Quercetin'] = {}
+    for day in coords2['day']:
+        drug_bayes_factors['Quercetin'][day] = {}
+        fig, axes = pyplot.subplots(6, 7, figsize=(7 * figscale, 6 * figscale))
+        for i, gene in enumerate(gene_lookup['gene_name']):
+            ax = axes.flat[i]
+            subtrace = drug_itrace.sel(treatment='Quercetin',
+                                       day=day,
+                                       gene=gene)
+            bf, out_ax = az.plot_bf(subtrace, ['quer_diff'], ax=ax)
+            drug_bayes_factors['Quercetin'][day][gene] = bf
+            ax.set_xlabel("quer diff {} day {}".format(gene, day))
+        pyplot.savefig("quer_diffs_day_{}_posterior.svg".format(day), bbox_inches="tight")
+        pyplot.show()
+    
+    drug_summary_table = az.summary(drug_itrace,
+                                    ['fis_diff', 'quer_diff'],
+                                    coords={'gene': tested_genes})
+    
+    name_matcher = re.compile(r"\[(.+),")
+    day_matcher = re.compile(r",\W*(\d+)]")
+    
+    bf10_col = []
+    bf01_col = []
+    treat_col = []
+    gene_col = []
+    day_col = []
+    
+    for idx_loc in drug_summary_table.index:
+        if 'quer' in idx_loc:
+            treat_id = 'Quercetin'
+        if 'fis' in idx_loc:
+            treat_id = 'Fisetin'
+        name_match = name_matcher.search(idx_loc)
+        gene_name = name_match.group(1)
+        day_match = day_matcher.search(idx_loc)
+        day_str_match = day_match.group(1)
+        day_num = int(day_str_match)
+        bf10 = drug_bayes_factors[treat_id][day_num][gene_name]['BF10']
+        bf01 = drug_bayes_factors[treat_id][day_num][gene_name]['BF01']
+        bf10_col.append(bf10)
+        bf01_col.append(bf01)
+        treat_col.append(treat_id)
+        gene_col.append(gene_name)
+        day_col.append(day_num)
+    
+    drug_summary_table['BF_10'] = bf10_col
+    drug_summary_table['BF_01'] = bf01_col
+    drug_summary_table['test_drug'] = treat_col
+    drug_summary_table['gene'] = gene_col
+    drug_summary_table['day'] = day_col
+    
+    drug_summary_table.to_csv("treated_silencing_diff_from_treat_only_posterior.csv")
+    
+    evid_silen_impair = drug_summary_table[(drug_summary_table['mean'] > 0) &
+                                           (drug_summary_table['BF_10'] > 10)]
+    silen_impair_count = evid_silen_impair.value_counts(subset=['test_drug',
+                                                                'gene']).reset_index()
+    silen_impair_hits = silen_impair_count[silen_impair_count['count'] >= 2].sort_values(['test_drug', 'gene'])
+    
+    fisetin_impair_bayesian = set()
+    quercetin_impair_bayesian = set()
+    
+    for i in range(len(silen_impair_hits)):
+        row = silen_impair_hits.iloc[i]
+        if row['test_drug'] == 'Fisetin':
+            fisetin_impair_bayesian.add(row['gene'])
+        if row['test_drug'] == 'Quercetin':
+            quercetin_impair_bayesian.add(row['gene'])
+    
+    fig, ax = pyplot.subplots()
+    fig.set_figheight(15)
+    fig.set_figwidth(15)
+    
+    bayes_venn = venn.venn3([bayesian_survival_implicated,
+                fisetin_impair_bayesian,
+                quercetin_impair_bayesian],
+               set_labels=['Survival', 'Fisetin', 'Quercetin'],
+               ax=ax)
+    bayes_venn.get_label_by_id('A').set_fontweight('bold')
+    bayes_venn.get_label_by_id('B').set_fontweight('bold')
+    bayes_venn.get_label_by_id('C').set_fontweight('bold')
+    
+    surv_only_label = '\n'.join(
+        map(lambda pair : '; '.join(pair),
+            itertools.batched(filter(lambda name : name not in ['FMNL3', 'PPP1R12C'],
+                                     bayesian_survival_implicated - (fisetin_impair_bayesian | quercetin_impair_bayesian)
+                                     ),
+                              2)
+            )
+        ) + '\n\nControls:\n{}'.format(['FMNL3', 'PPP1R12C'])
+    
+    bayes_venn.get_label_by_id('100').set_text(surv_only_label)
+    
+    fis_only_label = '\n'.join(
+        map(lambda pair: '; '.join(pair),
+            itertools.batched(fisetin_impair_bayesian - (bayesian_survival_implicated | quercetin_impair_bayesian),
+                              2
+                              )
+            )
+        )
+    
+    quer_and_fis_label = '\n'.join(
+        map(lambda pair: '; '.join(pair),
+            itertools.batched((fisetin_impair_bayesian & quercetin_impair_bayesian) - bayesian_survival_implicated,
+                              2
+                              )
+            )
+        )
+    
+    bayes_venn.get_label_by_id('010').set_text(fis_only_label)
+    bayes_venn.get_label_by_id('011').set_text(quer_and_fis_label)
+    
+    pyplot.title("Semi-Bayesian Identifications", fontsize=20)
+    pyplot.savefig("Semi_Bayesian_identifications.svg", bbox_inches="tight")
+    pyplot.show()
+    
+    fisetin_exceedance = (drug_itrace.posterior['fis_diff'] > 0).mean(('chain', 'draw', 'day'))
+    quercetin_exceedane = (drug_itrace.posterior['quer_diff'] > 0).mean(('chain', 'draw', 'day'))
+    
+    fis_ax = sb.barplot(x=fisetin_exceedance.gene, y=fisetin_exceedance)
+    pyplot.xticks(rotation=90)
+    pyplot.axhline(0.65, color='purple')
+    pyplot.ylabel("Probability silencing impairs drug action")
+    pyplot.title("Gene silencing impairs Fisetin senolysis - Bayesian")
+    pyplot.show()
+    
